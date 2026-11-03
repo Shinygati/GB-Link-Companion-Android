@@ -1,0 +1,8 @@
+.vscode/
+.west/
+zephyr/
+modules/
+build/
+bootloader/
+tools/
+.cache/

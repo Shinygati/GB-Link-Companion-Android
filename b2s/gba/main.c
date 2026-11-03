@@ -1,0 +1,760 @@
+/* Burn2Slot for GB-Link: GBA multiboot side. Receives commands and ROM data from the web page
+ * over the link cable and flashes the bootleg cart with the Burn2Slot routines (flash.c). */
+#include "gba.h"
+#include "proto.h"
+#include "flash.h"
+#include "sio.h"
+#include "ui.h"
+#include "save.h"
+#include "status.h"
+
+#define T_PACKET_MS  250    /* gap allowed between words inside a packet  */
+#define T_RESULT_MS  3000   /* how long to wait for the host to collect a result */
+
+/* reading the cart ROM (the simulator has its own cart) */
+#ifdef B2S_SIM
+u16 sim_cart_rd(u32 a);
+#define ROM16(i)  sim_cart_rd(i)
+#define ROM32(i)  ((u32)sim_cart_rd(2 * (i)) | (u32)sim_cart_rd(2 * (i) + 1) << 16)
+#else
+#define ROM16(i)  (((vu16 *)0x08000000)[i])
+#define ROM32(i)  (((vu32 *)0x08000000)[i])
+#endif
+
+static u32 args[MAX_ARGS];
+static int backup_save;   /* the save being read is part of a cartridge backup (MSG_BACKUP_SAVE) */
+static u32 block[MAX_BLOCK_WORDS];
+static u32 res[8];
+static const u32 *res_ptr;
+
+/* hand a result to the host: RESULT header, n data words, then IDLE.
+ * Runs from IWRAM: the GBA has to be listening again within the gap between two words. */
+IWRAM_CODE static void send_result(u32 status, const u32 *data, u32 n)
+{
+    for (int attempt = 0; attempt < 100; attempt++) {
+        sio_resync_arm(W_RESULT(status, n));
+        u32 i = 0, w;
+        for (;;) {
+            if (!sio_wait(&w, T_RESULT_MS)) { sio_resync_arm(W_IDLE); return; }   /* host gone */
+            if (w != W_POLL) break;                     /* out of step: start the result again */
+            if (i < n) sio_arm(data[i++]);
+            else { sio_arm(W_IDLE); return; }
+        }
+    }
+    sio_resync_arm(W_IDLE);
+}
+
+/* Wait for a complete packet (answering POLLs with IDLE meanwhile). Returns 1 if its checksum
+ * is good, 0 if not. Runs from IWRAM so every word is acknowledged within the gap. */
+IWRAM_CODE static int receive_packet(u32 *cmd_out, u32 *nargs_out, u32 *ndata_out)
+{
+    for (;;) {
+        u32 w;
+        if (!sio_wait(&w, 0)) continue;
+        if (w == W_POLL) { sio_arm(W_IDLE); continue; }
+        if (w == W_KEYS) { sio_arm(W_KEYS_REPLY(~REG_KEYINPUT)); continue; }   /* controller mode */
+        if (!IS_HEADER(w) || HDR_NARGS(w) > MAX_ARGS) { sio_resync_arm(W_IDLE); continue; }
+
+        u32 cmd = HDR_CMD(w), nargs = HDR_NARGS(w), ndata = 0, trailer, ck = CK_STEP(CK_INIT, w);
+        sio_arm(W_ACK(1));
+        if (nargs && !sio_recv(args, nargs, 2, 1, &ck, T_PACKET_MS)) { sio_resync_arm(W_IDLE); continue; }
+        if (cmd == CMD_WRITE || cmd == CMD_SAVE_WRITE || (cmd == CMD_STATUS && nargs >= 2 && args[1])) {
+            ndata = cmd == CMD_WRITE ? (nargs >= 2 ? args[1] : 0) : cmd == CMD_STATUS ? args[1]
+                  : (nargs >= 3 && args[2] <= MAX_SAVE_CHUNK ? args[2] / 4 : 0);
+            if (ndata == 0 || ndata > MAX_BLOCK_WORDS) { sio_resync_arm(W_IDLE); continue; }
+            if (!sio_recv(block, ndata, nargs + 2, 1, &ck, T_PACKET_MS)) { sio_resync_arm(W_IDLE); continue; }
+        }
+        u32 ck_payload = ck;
+        if (!sio_recv(&trailer, 1, 0, 0, &ck, T_PACKET_MS)) { sio_resync_arm(W_IDLE); continue; }
+        *cmd_out = cmd; *nargs_out = nargs; *ndata_out = ndata;
+        return trailer == ck_payload;
+    }
+}
+
+/* -------------------------------------------------------------------- streamed transfers
+ * GB-Link Cart Doctor's way of moving saves and ROMs (see proto.h): words follow each other with
+ * nothing in between, so the link runs at its full speed. Everything that waits on the link runs
+ * from IWRAM: the GBA has to be listening again within the gap between two words. */
+#define T_STREAM_MS  3000
+#define ST_STREAMED  0xFEu        /* run_command: the transfer is over, no RESULT to send */
+
+/* the streamed data lives in `block` (64 KB), which no other command needs at the same time */
+#define save_buf ((u8 *)block)
+#define SAVE_BUF_BYTES (MAX_BLOCK_WORDS * 4u)
+static volatile u32 stream_draw;   /* sections done, to draw on the progress bar (0: nothing new) */
+static u32 stream_op, stream_base, stream_total, stream_pct;
+static const char *stream_label, *stream_status;
+static void progress(u32 op, const char *label, const char *status, u32 done, u32 total);
+
+/* Drawing the bar takes longer than the gap between two words, so it's only drawn when its
+ * percentage changes: in a ROM stream that costs one word now and then, which the host notices
+ * and asks for again (S_SEEK). */
+static void stream_progress(void)
+{
+    u32 d = stream_draw;
+    if (!d || !stream_total) return;
+    stream_draw = 0;
+    u32 done = stream_base + d, total = stream_total;
+    while (total > 40000000u) { total >>= 1; done >>= 1; }
+    u32 pct = done * 100 / total;
+    if (pct == stream_pct) return;
+    stream_pct = pct;
+    progress(stream_op, stream_label, stream_status, stream_base + d, stream_total);
+}
+
+static void stream_start(u32 op, const char *label, const char *status, u32 base, u32 total)
+{
+    stream_op = op; stream_label = label; stream_status = status;
+    stream_base = base; stream_total = total; stream_pct = 0xFFFFFFFFu; stream_draw = 0;
+    progress(op, label, status, base, total);
+    stream_pct = total ? (base * 100 / total) : 0;
+}
+
+IWRAM_CODE static int xfer(u32 out, u32 *rx)
+{
+    sio_arm(out);
+    return sio_wait(rx, T_STREAM_MS);
+}
+
+/* Say `word` until the host answers `go` (S_CONT after G_DONE, S_GO after G_READY). */
+IWRAM_CODE static int gate(u32 word, u32 go)
+{
+    u32 rx;
+    sio_resync_arm(word);
+    for (;;) {
+        if (!sio_wait(&rx, T_STREAM_MS)) return 0;
+        if (rx == go) return 1;
+        if (rx == S_ABORT) return 0;
+        if (rx == W_POLL || rx == 0) sio_arm(word);
+        else sio_resync_arm(word);             /* a garbled word: get back in step first */
+    }
+}
+
+/* Cart Doctor's streamToMaster: len bytes in sections; the bar is drawn after the next word is
+ * ready, while the host's verdict travels back to the PC. */
+IWRAM_CODE static int stream_out(const u8 *base, u32 len)
+{
+    u32 off = 0, rx;
+    while (off < len) {
+        u32 x = 0;
+        for (u32 w = 0; w < STREAM_SECTION / 4; w++) {
+            u32 v = *(const u32 *)(base + off + w * 4);
+            x ^= v;
+            sio_arm(v);
+            if (w == 0) stream_progress();
+            if (!sio_wait(&rx, T_STREAM_MS) || rx == S_ABORT) return 0;
+        }
+        if (!xfer(x, &rx) || !xfer(0, &rx)) return 0;
+        if (rx == S_CONT) { off += STREAM_SECTION; stream_draw = off / STREAM_SECTION; }
+        else if (rx != S_FAIL) return 0;
+    }
+    return 1;
+}
+
+/* Cart Doctor's streamFromMaster: len bytes in sections, each checked; a damaged one is sent again. */
+IWRAM_CODE static int stream_in(u8 *base, u32 len)
+{
+    u32 off = 0, rx;
+    while (off < len) {
+        u32 x = 0;
+        for (u32 w = 0; w < STREAM_SECTION / 4; w++) {
+            if (!xfer(0, &rx)) return 0;
+            *(u32 *)(base + off + w * 4) = rx;
+            x ^= rx;
+        }
+        u32 theirs;
+        if (!xfer(0, &theirs)) return 0;
+        int ok = theirs == x;
+        if (!xfer(ok ? G_OKOK : G_FAIL, &rx) || rx != S_CONT) return 0;
+        if (ok) off += STREAM_SECTION;
+    }
+    return 1;
+}
+
+/* ROM dumps: runs of sections that are one repeated word (erased flash, padding) go as one short
+ * record (Cart Doctor's findFillRuns), in save_buf. */
+typedef struct { u32 start, count, value; } FillRun;
+#define MAX_FILL_RUNS (SAVE_BUF_BYTES / sizeof(FillRun))
+
+static u32 find_fill_runs(u32 sections, FillRun *runs, u32 max_runs)
+{
+    u32 n = 0;
+    for (u32 s = 0; s < sections; s++) {
+        u32 first = s * (STREAM_SECTION / 4), v = ROM32(first), w;
+        for (w = 1; w < STREAM_SECTION / 4; w++) if (ROM32(first + w) != v) break;
+        if (w < STREAM_SECTION / 4) continue;
+        if (n && runs[n - 1].value == v && runs[n - 1].start + runs[n - 1].count == s) runs[n - 1].count++;
+        else if (n < max_runs) { runs[n].start = s; runs[n].count = 1; runs[n].value = v; n++; }
+    }
+    return n;
+}
+
+static u32 fill_run_from(const FillRun *runs, u32 n, u32 s)
+{
+    u32 lo = 0, hi = n;
+    while (lo < hi) { u32 mid = (lo + hi) >> 1; if (runs[mid].start < s) lo = mid + 1; else hi = mid; }
+    return lo;
+}
+
+#define ROT1(c) (((c) << 1) | ((c) >> 31))
+
+/* Cart Doctor's streamRom: the whole ROM without waiting after each section; the host steers it
+ * with S_SEEK (carry on from a section), S_FIN (it has everything) or S_ABORT. */
+IWRAM_CODE static int stream_rom(u32 sections, const FillRun *runs, u32 nruns)
+{
+    u32 s = 0, fi = 0, rx;
+#define SEND(v) do { \
+        sio_arm(v); \
+        stream_progress(); \
+        if (!sio_wait(&rx, T_STREAM_MS)) return 0; \
+        if (rx != S_SPOLL) goto command; \
+    } while (0)
+    for (;;) {
+        if (s >= sections) { SEND(R_END | sections); continue; }
+        if (fi < nruns && runs[fi].start == s) {
+            const FillRun *r = &runs[fi];
+            u32 h = R_FILL | s, c = ROT1(ROT1(h) ^ r->value) ^ r->count;
+            SEND(h); SEND(r->value); SEND(r->count); SEND(c);
+            s += r->count; fi++;
+            stream_draw = s;
+            continue;
+        }
+        {
+            u32 h = R_DATA | s, c = h, first = s * (STREAM_SECTION / 4);
+            SEND(h);
+            for (u32 w = 0; w < STREAM_SECTION / 4; w++) {
+                u32 v = ROM32(first + w);
+                c = ROT1(c) ^ v;
+                SEND(v);
+            }
+            SEND(c);
+            s++;
+            stream_draw = s;
+            continue;
+        }
+command:
+        for (;;) {
+            if (rx == S_FIN) return 1;
+            if (rx == S_ABORT || rx == W_POLL || rx == 0) return 0;
+            if ((rx & 0xFF000000u) == S_SEEK && (rx & 0xFFFFFFu) <= sections) {
+                s = rx & 0xFFFFFFu;
+                fi = fill_run_from(runs, nruns, s);
+                break;
+            }
+            /* a garbled word: out of step. Get back in step and wait to be told where to go on */
+            sio_resync_arm(G_SYNC);
+            do { if (!sio_wait(&rx, T_STREAM_MS)) return 0; sio_arm(G_SYNC); } while (rx == S_SPOLL || rx == G_SYNC);
+        }
+    }
+#undef SEND
+}
+
+static void show_chip(void)
+{
+    ui_clear_line(3); ui_clear_line(4); ui_clear_line(5);
+    if (flash_kind() == KIND_UNKNOWN) {
+        ui_text(3, 1, C_RED, "Unknown flash  ID:");
+        ui_hex(3, 20, C_RED, cart.flashid, 4);
+        ui_text(4, 1, C_GREY, "Not a supported repro cart?");
+        return;
+    }
+    ui_text(3, 1, C_WHITE, "Flash ID:");
+    ui_hex(3, 11, C_CYAN, cart.flashid, 4);
+    ui_text(3, 17, C_GREY, flash_kind() == KIND_INTEL ? "(Intel)" : "(22XX)");
+    ui_text(4, 1, C_WHITE, "Maker:");
+    ui_text(4, 8, C_CYAN, flash_manufacturer((u8)cart.manufactorID));
+    ui_text(5, 1, C_WHITE, "Size:");
+    if (cart.size) { ui_dec(5, 7, C_CYAN, cart.size >> 20); ui_text(5, 7 + (cart.size >= (10u << 20) ? 2 : 1), C_CYAN, " MB"); }
+    else ui_text(5, 7, C_GREY, "unknown (no CFI)");
+}
+
+static void status_line(int color, const char *s)
+{
+    ui_clear_line(8);
+    ui_text(8, 1, color, s);
+}
+
+/* Text that differs between the two builds: the web page's flasher (Burn2Slot for GB-Link) and
+ * the helper GB-Link Companion sends (built with -DCOMPANION_UI). */
+#ifdef COMPANION_UI
+/* in the Pokemon game's language: GB-Link Companion sets the letter after "GBLLANG=" in this
+ * program before it sends it (E, F, D, I, S or J), and can change it later (MSG_LANG) */
+#include "lang.h"
+static volatile const char lang_marker[] = "GBLLANG=E";
+static u32 lang_i;
+static void set_lang(char c)
+{
+    lang_i = 0;
+    for (u32 i = 0; i < N_LANGS; i++)
+        if (lang_codes[i] == c) lang_i = i;
+    ui_jp = lang_codes[lang_i] == 'J';
+}
+#define TR(s)        (lang_text[lang_i][s])
+#define T_TITLE      TR(S_GB_LINK_COMPANION_FOR_MGBA)
+#define T_SUBTITLE   TR(S_PLAYING_IN_MGBA_ON_YOUR_PC)
+#define T_FOOT1      TR(S_KEEP_THE_LINK_CABLE_IN)
+#define T_FOOT2      TR(S_DON_T_SWITCH_OFF_MID_SAVE)
+#define T_WAITING    TR(S_WAITING_FOR_THE_PC)
+#define T_HELLO      TR(S_CONNECTED_TO_THE_PC)
+#define T_INFO_DONE  TR(S_CARTRIDGE_FOUND)
+#define T_READING    TR(S_LOADING_SAVE_INTO_MGBA)
+#define T_READ_DONE  TR(S_SAVE_LOADED_INTO_MGBA)
+#define T_WRITING    TR(S_SAVING_TO_THE_CART)
+#define T_WRITE_DONE TR(S_SAVE_WRITTEN_TO_THE_CART)
+#define L_READ       TR(S_LOAD)
+#define T_ROM_READ   TR(S_COPYING_THE_GAME_TO_THE_PC)
+#define T_ROM_DONE   TR(S_GAME_COPIED_TO_THE_PC)
+#define L_WRITE      TR(S_SAVE)
+#define L_COPY       TR(S_COPY)
+#define T_CHECKING   TR(S_CHECKING_THE_CARTRIDGE)
+#define T_SAVE_COPY  TR(S_COPYING_THE_SAVE_TO_THE_PC)
+#define T_SAVE_COPIED TR(S_SAVE_COPIED_TO_THE_PC)
+#define T_NO_CART    TR(S_NO_CARTRIDGE_FOUND)
+#define T_BACKING_UP TR(S_BACKING_UP_A_CARTRIDGE)
+#define T_GAME       TR(S_GAME)
+#define T_SIZE       TR(S_SIZE)
+#define T_HOLD_SEL   TR(S_HOLD_SELECT_FOR_THE_MENU)
+#define T_CONTROL    TR(S_GBA_BUTTONS_CONTROL_MGBA)
+#define T_NOTHING    TR(S_NOTHING_WAS_SAVED)
+#define T_BK_STOPPED TR(S_BACKUP_STOPPED)
+#define T_SWITCH_OFF TR(S_YOU_CAN_SWITCH_THE_GBA_OFF)
+#define T_BK_DONE    TR(S_BACKUP_FINISHED)
+#define T_MGBA_CLOSED TR(S_MGBA_CLOSED)
+#else
+#define T_TITLE      "Burn2Slot for GB-Link"
+#define T_SUBTITLE   "Repro cart flasher v1.0"
+#define T_FOOT1      "Keep the link cable connected"
+#define T_FOOT2      "and follow the web page."
+#define T_WAITING    "Waiting for the web page..."
+#define T_HELLO      "Connected to the web page"
+#define T_INFO_DONE  "Ready to back up / restore"
+#define T_READING    "Backing up the save..."
+#define T_READ_DONE  "Save backed up"
+#define T_WRITING    "Restoring the save..."
+#define T_WRITE_DONE "Save restored"
+#define L_READ       "Read"
+#define T_ROM_READ   "Dumping the ROM..."
+#define T_ROM_DONE   "ROM dumped"
+#define L_WRITE      "Write"
+#define L_COPY       "Copy"
+#define T_CHECKING   "Checking the cartridge..."
+#define T_SAVE_COPY  "Copying the save to the PC..."
+#define T_SAVE_COPIED "Save copied to the PC"
+#define T_NO_CART    "No cartridge found"
+#define T_BACKING_UP "Backing up a cartridge"
+#define T_GAME       "Game:"
+#define T_SIZE       "Size:"
+#define T_HOLD_SEL   "Hold SELECT for the menu"
+#define T_CONTROL    "GBA buttons control mGBA"
+#define T_NOTHING    "Nothing was saved."
+#define T_BK_STOPPED "Backup stopped"
+#define T_SWITCH_OFF "You can switch the GBA off."
+#define T_BK_DONE    "Backup finished"
+#define T_MGBA_CLOSED "mGBA closed"
+#endif
+
+/* Progress on row 7. The bar shows work that is finished: it's drawn before an operation with
+ * what was done so far, and again afterwards. A new kind of operation clears the row first. */
+static u32 cur_op;
+static void progress(u32 op, const char *label, const char *status, u32 done, u32 total)
+{
+    if (op != cur_op) {
+        cur_op = op;
+        status_line(C_YELLOW, status);
+        ui_clear_line(7);
+        ui_text(7, 1, C_WHITE, label);
+    }
+    ui_bar(7, done, total);
+}
+
+/* save progress: in steps when the host says which step this is (args 3 and 4: the launcher only
+ * writes the 4 KB blocks that changed), otherwise by position in the save. */
+static void save_progress(u32 op, const char *label, const char *status, u32 nargs, int after)
+{
+    if (nargs >= 5 && args[4]) progress(op, label, status, args[3] + (after ? 1 : 0), args[4]);
+    else progress(op, label, status, args[1] + (after ? args[2] : 0), save_size(args[0]));
+}
+
+#ifndef COMPANION_UI
+static const char *const save_names[] = {"none", "SRAM 32 KB", "SRAM 64 KB", "Flash 64 KB", "Flash 128 KB", "EEPROM 512 B", "EEPROM 8 KB"};
+#endif
+
+/* the normal screen: title, subtitle and the footer */
+static void draw_home(void)
+{
+    ui_init();
+    ui_text(0, 1, C_WHITE, T_TITLE);
+    ui_text(1, 1, C_GREY, T_SUBTITLE);
+    ui_text(10, 1, C_GREY, T_FOOT1);
+    ui_text(11, 1, C_GREY, T_FOOT2);
+    cur_op = 0;
+}
+
+/* The cartridge's real-time clock (Seiko S-3511) on the cart's GPIO port, the way pret's siirtc.c
+ * reads it: 3 pins (SCK, SIO, CS), commands MSB first, data LSB first. The port reads back only
+ * while read-enable is on; it's switched off again so ROM reads see the ROM. */
+#ifndef B2S_SIM
+#define GPIO_DATA   (*(vu16 *)0x080000C4)
+#define GPIO_DIR    (*(vu16 *)0x080000C6)
+#define GPIO_ENABLE (*(vu16 *)0x080000C8)
+#define RTC_SCK 1
+#define RTC_SIO 2
+#define RTC_CS  4
+static void rtc_command(u8 v)
+{
+    for (int i = 0; i < 8; i++) {
+        u16 b = (u16)(((v >> (7 - i)) & 1) << 1);
+        GPIO_DATA = b | RTC_CS; GPIO_DATA = b | RTC_CS; GPIO_DATA = b | RTC_CS;
+        GPIO_DATA = b | RTC_CS | RTC_SCK;
+    }
+}
+static u8 rtc_byte(void)
+{
+    u8 v = 0;
+    for (int i = 0; i < 8; i++) {
+        for (int k = 0; k < 5; k++) GPIO_DATA = RTC_CS;
+        GPIO_DATA = RTC_CS | RTC_SCK;
+        v = (u8)((v >> 1) | (((GPIO_DATA & RTC_SIO) >> 1) << 7));
+    }
+    return v;
+}
+/* reads command cmd's n bytes into out */
+static void rtc_read(u8 cmd, u8 *out, int n)
+{
+    GPIO_DATA = RTC_SCK;
+    GPIO_DATA = RTC_SCK | RTC_CS;
+    GPIO_DIR = RTC_SCK | RTC_SIO | RTC_CS;
+    rtc_command(cmd);
+    GPIO_DIR = RTC_SCK | RTC_CS;
+    for (int i = 0; i < n; i++) out[i] = rtc_byte();
+    GPIO_DATA = RTC_SCK;
+    GPIO_DATA = RTC_SCK;
+}
+static int rtc_get(u8 *status, u8 *dt)
+{
+    GPIO_ENABLE = 1;
+    rtc_read(0x65, dt, 7);                 /* once to start the chip's transfer state off right */
+    rtc_read(0x63, status, 1);             /* status register */
+    rtc_read(0x65, dt, 7);                 /* date and time */
+    GPIO_DIR = 0;
+    GPIO_ENABLE = 0;
+    /* nothing there: the pins read back as all 1s or all 0s */
+    int same = 1;
+    for (int i = 1; i < 7; i++) same &= dt[i] == dt[0];
+    return !(same && (dt[0] == 0xFF || dt[0] == 0x00));
+}
+#else
+static int rtc_get(u8 *status, u8 *dt) { (void)status; (void)dt; return 0; }
+#endif
+
+static u32 run_command(u32 cmd, u32 nargs, u32 ndata, u32 *nres)
+{
+    *nres = 0;
+    if (status_active() && cmd != CMD_STATUS) {   /* e.g. a save to write: show the normal screen */
+        status_leave();
+        draw_home();
+    }
+    res_ptr = res;
+    if (cmd != CMD_ERASE && cmd != CMD_WRITE && cmd != CMD_SAVE_READ && cmd != CMD_SAVE_WRITE && cmd != CMD_ROM_READ)
+        cur_op = 0;
+    switch (cmd) {
+    case CMD_SAVE_INFO: {
+        status_line(C_YELLOW, T_CHECKING);
+        u32 fid, t = save_detect(&fid);
+        res[0] = t; res[1] = fid; save_title(&res[2]); *nres = 6;
+        ui_clear_line(3); ui_clear_line(4); ui_clear_line(5);
+        char title[13]; for (int i = 0; i < 12; i++) { char c = (char)(res[2 + i / 4] >> (8 * (i & 3))); title[i] = (c >= 32 && c < 127) ? c : ' '; } title[12] = 0;
+        ui_text(3, 1, C_WHITE, T_GAME); ui_text(3, 7, C_CYAN, title);
+#ifndef COMPANION_UI
+        ui_text(4, 1, C_WHITE, "Save:"); ui_text(4, 7, C_CYAN, save_names[t]);
+#endif
+        ui_clear_line(7);
+        status_line(C_GREEN, T_INFO_DONE);
+        return ST_OK;
+    }
+    case CMD_SAVE_READ: {
+        if (nargs < 3 || args[2] > MAX_SAVE_READ_CHUNK || (args[2] & 3)) return ST_BAD_COMMAND;
+        if (!save_size(args[0])) return ST_NO_SAVE;
+        const char *reading = backup_save ? T_SAVE_COPY : T_READING;
+        save_progress(CMD_SAVE_READ, L_READ, reading, nargs, 0);
+        u8 *buf = (u8 *)(block + 1);
+        if (save_read(args[0], args[1], args[2], buf)) return ST_TOO_BIG;
+        save_progress(CMD_SAVE_READ, L_READ, reading, nargs, 1);
+        u32 ck = CK_INIT, n = args[2] / 4, same = 1;
+        for (u32 i = 0; i < n; i++) { ck = CK_STEP(ck, block[1 + i]); same &= block[1 + i] == block[1]; }
+        block[0] = ck;
+        res_ptr = block; *nres = same && n > 1 ? 2 : n + 1;   /* all one word (blank): just that word */
+        if (nargs >= 5 ? args[3] + 1 >= args[4] : args[1] + args[2] >= save_size(args[0])) status_line(C_GREEN, backup_save ? T_SAVE_COPIED : T_READ_DONE);
+        return ST_OK;
+    }
+    case CMD_SAVE_WRITE: {
+        if (nargs < 3 || !save_size(args[0])) return ST_NO_SAVE;
+        save_progress(CMD_SAVE_WRITE, L_WRITE, T_WRITING, nargs, 0);
+        u8 got = 0;
+#ifndef B2S_SIM
+        sio_service_on(1);      /* the write takes a while: keep answering the host's KEYS polls meanwhile */
+#endif
+        int bad = save_write(args[0], args[1], args[2], (const u8 *)block, &got);
+#ifndef B2S_SIM
+        sio_service_on(0);
+#endif
+        if (bad == -2) return ST_TOO_BIG;
+        if (bad >= 0) { res[0] = (u32)bad; res[1] = got; res[2] = ((const u8 *)block)[bad - (int)args[1]]; *nres = 3; return ST_VERIFY_FAIL; }
+        save_progress(CMD_SAVE_WRITE, L_WRITE, T_WRITING, nargs, 1);
+        if (nargs >= 5 ? args[3] + 1 >= args[4] : args[1] + args[2] >= save_size(args[0])) status_line(C_GREEN, T_WRITE_DONE);
+        return ST_OK;
+    }
+    case CMD_SAVE_DUMP: {          /* streamed save read (Cart Doctor) */
+        if (nargs < 3 || !args[2] || args[2] > MAX_STREAM_SAVE || (args[2] % STREAM_SECTION)) return ST_BAD_COMMAND;
+        if (!save_size(args[0])) return ST_NO_SAVE;
+        const char *reading = backup_save ? T_SAVE_COPY : T_READING;
+        u32 secs = args[2] / STREAM_SECTION;
+        stream_start(CMD_SAVE_READ, L_READ, reading, 0, secs);
+        if (save_read(args[0], args[1], args[2], save_buf)) return ST_TOO_BIG;
+        if (!gate(G_DONE, S_CONT) || !stream_out(save_buf, args[2])) { status_line(C_YELLOW, T_WAITING); return ST_STREAMED; }
+        progress(CMD_SAVE_READ, L_READ, reading, secs, secs);
+        if (nargs < 5 || args[3] + 1 >= args[4]) status_line(C_GREEN, backup_save ? T_SAVE_COPIED : T_READ_DONE);
+        return ST_STREAMED;
+    }
+    case CMD_SAVE_PUT: {           /* streamed save write (Cart Doctor's transfer, this helper's chip code) */
+        if (nargs < 3 || !args[2] || args[2] > MAX_STREAM_SAVE || (args[2] % STREAM_SECTION)) return ST_BAD_COMMAND;
+        if (!save_size(args[0])) return ST_NO_SAVE;
+        if (args[1] + args[2] > save_size(args[0])) return ST_TOO_BIG;
+        if ((args[0] == SAVE_FLASH64 || args[0] == SAVE_FLASH128) && ((args[1] | args[2]) & 0xFFF)) return ST_BAD_COMMAND;
+        stream_start(CMD_SAVE_WRITE, L_WRITE, T_WRITING, 0, 2);
+        if (!gate(G_READY, S_GO) || !stream_in(save_buf, args[2])) return ST_CHECKSUM;
+        progress(CMD_SAVE_WRITE, L_WRITE, T_WRITING, 1, 2);
+        u8 got = 0;
+#ifndef B2S_SIM
+        sio_service_on(1);      /* the write takes a while: keep answering the host's KEYS polls meanwhile */
+#endif
+        int bad = save_write(args[0], args[1], args[2], save_buf, &got);
+#ifndef B2S_SIM
+        sio_service_on(0);
+#endif
+        if (bad == -2) return ST_TOO_BIG;
+        if (bad >= 0) { res[0] = (u32)bad; res[1] = got; res[2] = save_buf[bad - (int)args[1]]; *nres = 3; return ST_VERIFY_FAIL; }
+        progress(CMD_SAVE_WRITE, L_WRITE, T_WRITING, 2, 2);
+        if (nargs < 5 || args[3] + 1 >= args[4]) status_line(C_GREEN, T_WRITE_DONE);
+        return ST_OK;
+    }
+    case CMD_ROM_STREAM: {         /* streamed ROM dump (Cart Doctor) */
+        if (nargs < 1 || !args[0] || args[0] > (1u << 25) || (args[0] % STREAM_SECTION)) return ST_BAD_COMMAND;
+        u32 secs = args[0] / STREAM_SECTION;
+        status_line(C_YELLOW, T_ROM_READ);
+        u32 runs = find_fill_runs(secs, (FillRun *)save_buf, MAX_FILL_RUNS);
+        stream_start(CMD_ROM_READ, L_COPY, T_ROM_READ, 0, secs);
+        if (!gate(G_DONE, S_CONT) || !stream_rom(secs, (const FillRun *)save_buf, runs)) {
+            status_line(C_YELLOW, T_WAITING);
+            return ST_STREAMED;
+        }
+        progress(CMD_ROM_READ, L_COPY, T_ROM_READ, secs, secs);
+        status_line(C_GREEN, T_ROM_DONE);
+        return ST_STREAMED;
+    }
+    case CMD_HELLO:
+        res[0] = B2S_VERSION; *nres = 1;
+        backup_save = 0;
+        status_line(C_GREEN, T_HELLO);
+        return ST_OK;
+
+    case CMD_DETECT: {
+        status_line(C_YELLOW, "Detecting flash chip...");
+        int k = flash_detect();
+        res[0] = cart.flashid; res[1] = cart.manufactorID; res[2] = cart.size;
+        res[3] = (u32)cart.bufferSize | (u32)cart.busType << 16 | (u32)cart.adressSeqType << 24;
+        *nres = 4;
+        show_chip();
+        status_line(k ? C_GREEN : C_RED, k ? "Ready - choose a ROM" : "No supported flash found");
+        return k ? ST_OK : ST_UNKNOWN_FLASH;
+    }
+
+    case CMD_ERASE:
+        if (nargs < 2) return ST_BAD_COMMAND;
+        if (flash_kind() == KIND_UNKNOWN) return ST_UNKNOWN_FLASH;
+        if (args[0] >= 0x01000000u) return ST_TOO_BIG;
+        progress(CMD_ERASE, "Erase", "Erasing...", args[0], args[1]);
+        if (flash_erase_step(args[0])) return ST_TIMEOUT;
+        progress(CMD_ERASE, "Erase", "Erasing...", args[0] + 0x8000, args[1]);
+        return ST_OK;
+
+    case CMD_WRITE: {
+        if (nargs < 3) return ST_BAD_COMMAND;
+        if (flash_kind() == KIND_UNKNOWN) return ST_UNKNOWN_FLASH;
+        u32 off = args[0], words16 = ndata * 2;
+        if ((off & 1) || off + ndata * 4 > 0x02000000u) return ST_TOO_BIG;
+        progress(CMD_WRITE, "Write", "Writing...", off, args[2]);
+        const u16 *w = (const u16 *)block;
+        int bad = flash_write_block(off, w, words16);
+        if (bad >= 0) { res[0] = off + (u32)bad * 2; *nres = 1; return ST_WRITE_FAIL; }
+        u16 got;
+        bad = flash_verify_block(off, w, words16, &got);
+        if (bad >= 0) { res[0] = off + (u32)bad * 2; res[1] = got; res[2] = w[bad]; *nres = 3; return ST_VERIFY_FAIL; }
+        progress(CMD_WRITE, "Write", "Writing...", off + ndata * 4, args[2]);
+        return ST_OK;
+    }
+
+    case CMD_ROM_INFO: {
+        /* the size: the first power-of-two boundary (from 1 MB) where the ROM has ended. Past the
+         * end, either
+         *  - the cart bus answers each halfword with its own address (open bus: 0, 1, 2, ...;
+         *    the method GB-Link Cart Doctor uses), or
+         *  - the ROM chip shows up again from its start (a mirror: many official carts don't
+         *    wire the top address lines, e.g. a 16 MB Pokemon cart repeats at 16 MB).
+         * 8 KB is compared, header included, so a real game can't match by chance. */
+        status_line(C_YELLOW, T_CHECKING);
+        u32 size = 0xFFFFFFFFu;
+        if (ROM32(1) == 0x51AEFF24u) {                          /* the logo is there: a cart */
+            for (size = 1u << 20; size < (1u << 25); size <<= 1) {
+                int open = 1, mirror = 1;
+                for (u32 j = 0; j < 0x1000 && (open || mirror); j++) {
+                    u16 v = ROM16(size / 2 + j);
+                    if (v != (u16)j) open = 0;
+                    if (v != ROM16(j)) mirror = 0;
+                }
+                if (open || mirror) break;
+            }
+            /* No end found on the bus: a repro cart's flash chip (usually 32 MB) with the game in
+             * its start and erased flash (FF) after it. Measure where the game's data ends and
+             * round up to a power of two (Pokemon Ruby: data to 14.7 MB -> 16 MB). Official carts
+             * never get here (their end shows on the bus), so their size is never trimmed. */
+            if (size == 1u << 25) {
+                status_line(C_YELLOW, "Measuring the game...");
+                u32 i = (1u << 25) / 4;
+                while (i > 0 && ROM32(i - 1) == 0xFFFFFFFFu) i--;
+                u32 end = i * 4, p2 = 1u << 20;
+                while (p2 < end) p2 <<= 1;
+                size = p2;
+                /* Still 32 MB: something is stored after the game (an older, bigger game left in
+                 * the flash). Games are padded with FF up to their size, so guess the biggest
+                 * size that ends in at least 4 KB of FF, and let the PC ask (ROM_SIZE_GUESSED). */
+                if (size == 1u << 25) {
+                    for (u32 p = 1u << 24; p >= 1u << 20; p >>= 1) {
+                        int pad = 1;
+                        for (u32 k = (p - 4096) / 4; k < p / 4; k++)
+                            if (ROM32(k) != 0xFFFFFFFFu) { pad = 0; break; }
+                        if (pad) { size = p | ROM_SIZE_GUESSED; break; }
+                    }
+                }
+                size |= ROM_SIZE_REPRO;
+            }
+        }
+        block[0] = size;
+        for (u32 i = 0; i < 0xC0 / 4; i++) block[1 + i] = ROM32(i);
+        res_ptr = block; *nres = 1 + 0xC0 / 4;
+        if (size == 0xFFFFFFFFu) { status_line(C_RED, T_NO_CART); return ST_NO_SAVE; }
+        u32 shown = size & ~ROM_SIZE_FLAGS;
+        char title[13]; for (int i = 0; i < 12; i++) { char c = (char)(block[1 + 0xA0 / 4 + i / 4] >> (8 * (i & 3))); title[i] = (c >= 32 && c < 127) ? c : ' '; } title[12] = 0;
+        ui_clear_line(3); ui_clear_line(4); ui_clear_line(5); ui_clear_line(7);
+#ifdef COMPANION_UI
+        ui_clear_line(1); ui_text(1, 1, C_GREY, T_BACKING_UP);
+#endif
+        ui_text(3, 1, C_WHITE, T_GAME); ui_text(3, 7, C_CYAN, title);
+        ui_text(4, 1, C_WHITE, T_SIZE); ui_dec(4, 7, C_CYAN, shown >> 20); ui_text(4, 7 + (shown >= (10u << 20) ? 2 : 1), C_CYAN, (size & ROM_SIZE_GUESSED) ? " MB?" : " MB");
+        status_line(C_GREEN, T_INFO_DONE);
+        return ST_OK;
+    }
+    case CMD_RTC_READ: {
+        u8 st = 0, dt[8] = {0};
+        res[0] = (u32)rtc_get(&st, dt);
+        res[1] = st;
+        res[2] = dt[0] | dt[1] << 8 | dt[2] << 16 | (u32)dt[3] << 24;
+        res[3] = dt[4] | dt[5] << 8 | dt[6] << 16;
+        *nres = 4;
+        return ST_OK;
+    }
+    case CMD_ROM_READ: {
+        if (nargs < 2 || args[1] == 0 || args[1] > MAX_ROM_CHUNK || (args[1] & 3) || args[0] + args[1] > (1u << 25))
+            return ST_BAD_COMMAND;
+        u32 done = nargs >= 4 ? args[2] : 0, steps = nargs >= 4 ? args[3] : 0;
+        if (steps) progress(CMD_ROM_READ, L_COPY, T_ROM_READ, done, steps);
+        u32 ck = CK_INIT, n = args[1] / 4, first = args[0] / 4;
+        u32 same = 1;
+        for (u32 i = 0; i < n; i++) { u32 w = ROM32(first + i); block[1 + i] = w; ck = CK_STEP(ck, w); same &= w == block[1]; }
+        block[0] = ck;
+        res_ptr = block; *nres = same && n > 1 ? 2 : n + 1;   /* all one word (padding): just that word */
+        if (steps) {
+            progress(CMD_ROM_READ, L_COPY, T_ROM_READ, done + 1, steps);
+            if (done + 1 >= steps) status_line(C_GREEN, T_ROM_DONE);
+        }
+        return ST_OK;
+    }
+
+    case CMD_SHOW:
+        if (nargs < 1) return ST_BAD_COMMAND;
+        switch (args[0]) {
+        case MSG_CONTROLLER:
+            backup_save = 0;
+            ui_clear_line(1); ui_text(1, 1, C_GREY, T_SUBTITLE);
+            ui_clear_line(7);
+#ifdef COMPANION_UI
+            if (nargs >= 2 && args[1]) ui_text(7, 1, C_GREY, T_HOLD_SEL);
+#endif
+            status_line(C_CYAN, T_CONTROL);
+            break;
+        case MSG_BACKUP_SAVE:
+            backup_save = 1;
+            break;
+        case MSG_BACKUP_STOPPED:
+            backup_save = 0;
+            ui_clear_line(7);
+            ui_text(7, 1, C_GREY, T_NOTHING);
+            status_line(C_YELLOW, T_BK_STOPPED);
+            break;
+#ifdef COMPANION_UI
+        case MSG_LANG:                     /* the game's language: the screen again in it */
+            if (nargs >= 2) set_lang((char)args[1]);
+            draw_home();
+            status_line(C_GREEN, T_HELLO);
+            break;
+#endif
+        case MSG_BACKUP_DONE:
+            backup_save = 0;
+            ui_clear_line(7);
+            ui_text(7, 1, C_GREY, T_SWITCH_OFF);
+            status_line(C_GREEN, T_BK_DONE);
+            break;
+        }
+        return ST_OK;
+
+    case CMD_STATUS:
+        if (nargs >= 1 && args[0] == ST_OP_LEAVE) {
+            if (status_active()) status_leave();
+            draw_home();                       /* mGBA was closed: the helper's own screen */
+            ui_clear_line(7);
+            status_line(C_GREEN, T_MGBA_CLOSED);
+            return ST_OK;
+        }
+        return status_command(args, nargs, block, ndata);
+
+    case CMD_FINISH:
+        if (nargs >= 1 && args[0]) {
+            status_line(C_GREEN, "Done! Switch off, then play.");
+            ui_text(7, 1, C_WHITE, "Write");
+            ui_bar(7, 1, 1);
+        } else {
+            status_line(C_RED, "Stopped - see the web page");
+        }
+        return ST_OK;
+    }
+    return ST_BAD_COMMAND;
+}
+
+int main(void)
+{
+#ifdef COMPANION_UI
+    set_lang(lang_marker[8]);
+#endif
+    draw_home();
+    status_line(C_YELLOW, T_WAITING);
+    sio_init();
+    sio_resync_arm(W_IDLE);
+
+    for (;;) {
+        u32 cmd, nargs, ndata, n;
+        int ok = receive_packet(&cmd, &nargs, &ndata);
+        u32 st = ok ? run_command(cmd, nargs, ndata, &n) : (n = 0, ST_CHECKSUM);
+        if (st == ST_STREAMED) { sio_resync_arm(W_IDLE); continue; }   /* streamed: no RESULT */
+        send_result(st, res_ptr, n);
+    }
+}

@@ -1,0 +1,20 @@
+# Android / Gradle generated files
+.gradle/
+.cxx/
+**/build/
+local.properties
+.idea/
+*.iml
+
+# Local distribution files and signing material
+/dist/
+*.keystore
+*.jks
+
+# Personal game saves
+*.sav
+*.srm
+
+# Operating system files
+.DS_Store
+Thumbs.db
