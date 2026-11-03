@@ -4,7 +4,7 @@ An Android companion application that combines **mGBA emulation** with save data
 
 The application loads ROMs from phone storage, reads the matching cartridge's save before a new play session, and writes in-game saves back to the cartridge. Players can disconnect GB-Link during gameplay and reconnect later to synchronize their progress.
 
-This project is an Android adaptation of [GB-Link Companion](https://github.com/Shinygati/GB-Link-Companion), created by **Shinygati**. It reuses the original project's cartridge helper, protocol work, and icon assets, with an Android interface and an embedded mGBA frontend.
+This project is an Android adaptation of [GB-Link Companion](https://github.com/Shinygati/GB-Link-Companion). It reuses the original project's cartridge helper, protocol work, and icon assets, with an Android interface and an embedded mGBA frontend.
 
 > **Development status:** version **0.1.1 alpha**. The application builds and passes the automated checks described below. End-to-end validation on a real Android phone, GB-Link adapter, and cartridge remains outstanding.
 
